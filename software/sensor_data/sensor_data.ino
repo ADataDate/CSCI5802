@@ -44,7 +44,8 @@ float GSRtemp=0;
 
 void setup()
 {
-  Serial.begin(115200);
+  Serial.begin(9600
+  );
   Serial.println("Initializing...");
   delay(1000);
   Wire.begin();
