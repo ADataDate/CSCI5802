@@ -1,30 +1,51 @@
+
+#include <SPI.h>
 #include <Wire.h>
 #include "MAX30105.h"
 #include "heartRate.h"
-#include "SparkFunBME280.h"
+#include "spo2_algorithm.h"
 
 #define GSR A0
 
+
+
 MAX30105 particleSensor;
-BME280 mySensor;
+
+#define MAX_BRIGHTNESS 255
 
 const byte RATE_SIZE = 4; //Increase this for more averaging. 4 is good.
 byte rates[RATE_SIZE]; //Array of heart rates
 byte rateSpot = 0;
 long lastBeat = 0; //Time at which the last beat occurred
 
+#if defined(__AVR_ATmega328P__) || defined(__AVR_ATmega168__)
+//Arduino Uno doesn't have enough SRAM to store 100 samples of IR led data and red led data in 32-bit format
+//To solve this problem, 16-bit MSB of the sampled data will be truncated. Samples become 16-bit data.
+uint16_t irBuffer[100]; //infrared LED sensor data
+uint16_t redBuffer[100];  //red LED sensor data
+#else
+uint32_t irBuffer[100]; //infrared LED sensor data
+uint32_t redBuffer[100];  //red LED sensor data
+#endif
+
+int32_t bufferLength; //data length
+int32_t spo2; //SPO2 value
+int8_t validSPO2; //indicator to show if the SPO2 calculation is valid
+int32_t heartRate; //heart rate value
+int8_t validHeartRate; //indicator to show if the heart rate calculation is valid
+
 float beatsPerMinute;
 int beatAvg;
 long sum = 0;
 
-int thresholds = 0;
-int sensorValue;
+float thresholds = 0;
+float sensorValue;
+float GSRtemp=0;
 
 void setup()
 {
-  Serial.begin(9600);
+  Serial.begin(115200);
   Serial.println("Initializing...");
-  Serial.println("Reading basic values from BME280");
   delay(1000);
   Wire.begin();
 
@@ -34,17 +55,16 @@ void setup()
     Serial.println("MAX30105 was not found. Please check wiring/power. ");
     while (1);
   }
-  Serial.println("Place your index finger on the sensor with steady pressure.");
 
-  if (mySensor.beginI2C() == false) //Begin communication over I2C
-  {
-    Serial.println("The sensor did not respond. Please check wiring.");
-    while (1); //Freeze
-  }
 
-  particleSensor.setup(); //Configure sensor with default settings
-  particleSensor.setPulseAmplitudeRed(0x0A); //Turn Red LED to low to indicate sensor is running
-  particleSensor.setPulseAmplitudeGreen(0); //Turn off Green LED
+  byte ledBrightness = 60; //Options: 0=Off to 255=50mA
+  byte sampleAverage = 4; //Options: 1, 2, 4, 8, 16, 32
+  byte ledMode = 2; //Options: 1 = Red only, 2 = Red + IR, 3 = Red + IR + Green
+  byte sampleRate = 100; //Options: 50, 100, 200, 400, 800, 1000, 1600, 3200
+  int pulseWidth = 411; //Options: 69, 118, 215, 411
+  int adcRange = 4096; //Options: 2048, 4096, 8192, 16384
+
+  particleSensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange); //Configure sensor with these settings
 
   for (int i = 0; i < 500; i++)
   {
@@ -53,70 +73,82 @@ void setup()
     delay(5);
   }
   thresholds = sum / 500;
-  Serial.print("thresholds =");
-  Serial.println(thresholds);
+  //Serial.print("thresholds =");
+  //Serial.println(thresholds);
 }
 
 void loop()
 {
-  Serial.println();
-  Serial.print("Humidity: ");
-  Serial.println(mySensor.readFloatHumidity(), 0);
-  Serial.print(" Temp: ");
-  //Serial.print(mySensor.readTempC(), 2);
-  Serial.println(mySensor.readTempF(), 2);
-  Serial.println();
+  bufferLength = 100; //buffer length of 100 stores 4 seconds of samples running at 25sps
 
-  int GSRtemp;
-  sensorValue = analogRead(GSR);
-  Serial.print("sensorValue=");
-  Serial.println(sensorValue);
-  GSRtemp = thresholds - sensorValue;
-  if (abs(GSRtemp) > 60)
+  //read the first 100 samples, and determine the signal range
+  for (byte i = 0 ; i < bufferLength ; i++)
+  {
+    while (particleSensor.available() == false) //do we have new data?
+      particleSensor.check(); //Check the sensor for new data
+
+    redBuffer[i] = particleSensor.getRed();
+    irBuffer[i] = particleSensor.getIR();
+    particleSensor.nextSample(); //We're finished with this sample so move to next sample
+
+    //Serial.print(F("red="));
+   // Serial.print(redBuffer[i], DEC);
+    //Serial.print(F(", ir="));
+   // Serial.println(irBuffer[i], DEC);
+  }
+
+  //calculate heart rate and SpO2 after first 100 samples (first 4 seconds of samples)
+  maxim_heart_rate_and_oxygen_saturation(irBuffer, bufferLength, redBuffer, &spo2, &validSPO2, &heartRate, &validHeartRate);
+
+  //Continuously taking samples from MAX30102.  Heart rate and SpO2 are calculated every 1 second
+  while (1)
   {
     sensorValue = analogRead(GSR);
     GSRtemp = thresholds - sensorValue;
-    if (abs(GSRtemp) > 60) {
-      Serial.println("Emotion Changes Detected!");
-    }
-  }
-    else {
-      Serial.println("No Change in Emotions");
-    }
-
-
-    long irValue = particleSensor.getIR();
-
-    if (checkForBeat(irValue) == true)
+   
+    //dumping the first 25 sets of samples in the memory and shift the last 75 sets of samples to the top
+    for (byte i = 25; i < 100; i++)
     {
-      Serial.println("We sensed a beat!");
-      long delta = millis() - lastBeat;
-      lastBeat = millis();
-
-      beatsPerMinute = 60 / (delta / 1000.0);
-
-      if (beatsPerMinute < 255 && beatsPerMinute > 20)
-      {
-        rates[rateSpot++] = (byte)beatsPerMinute; //Store this reading in the array
-        rateSpot %= RATE_SIZE; //Wrap variable
-
-        //Take average of readings
-        beatAvg = 0;
-        for (byte x = 0 ; x < RATE_SIZE ; x++)
-          beatAvg += rates[x];
-        beatAvg /= RATE_SIZE;
-      }
+      redBuffer[i - 25] = redBuffer[i];
+      irBuffer[i - 25] = irBuffer[i];
     }
 
-    Serial.print("IR= ");
-    Serial.println(irValue);
-    Serial.print("BPM= ");
-    Serial.println(beatsPerMinute);
-    Serial.print("Avg BPM= ");
-    Serial.println(beatAvg);
+    //take 25 sets of samples before calculating the heart rate.
+    for (byte i = 75; i < 100; i++)
+    {
+      while (particleSensor.available() == false) //do we have new data?
+        particleSensor.check(); //Check the sensor for new data
 
-    if (irValue < 50000) {
-      Serial.println(" No finger?");
+      //digitalWrite(readLED, !digitalRead(readLED)); //Blink onboard LED with every data read
+
+      redBuffer[i] = particleSensor.getRed();
+      irBuffer[i] = particleSensor.getIR();
+      particleSensor.nextSample(); //We're finished with this sample so move to next sample
+
+      //send samples and calculation result to terminal program through UART
+     // Serial.print(F("red="));
+      //Serial.print(redBuffer[i], DEC);
+      //Serial.print(F(", ir="));
+      //Serial.print(irBuffer[i], DEC);
+      Serial.print(F("GSR="));
+      Serial.print(GSRtemp, DEC);
+      
+      Serial.print(F(", HR="));
+      Serial.print(heartRate, DEC);
+
+      Serial.print(F(", SPO2="));
+      Serial.print(spo2, DEC);
+
+      Serial.print(F(", HRvalid="));
+      Serial.print(validHeartRate, DEC);
+
+      Serial.print(F(", SPO2Valid="));
+      Serial.println(validSPO2, DEC);
+
     }
-  delay (2000);
+
+    //After gathering 25 new samples recalculate HR and SP02
+    maxim_heart_rate_and_oxygen_saturation(irBuffer, bufferLength, redBuffer, &spo2, &validSPO2, &heartRate, &validHeartRate);
+  }
+
 }
